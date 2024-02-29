@@ -48,6 +48,16 @@
   until: "vm_start_results is success"
   retries: 15
   delay: 2
+- name: wait for domifaddr
+  ansible.builtin.shell: "virsh domifaddr {{ vm_name }} | grep 'ipv4' | awk '{print
+    $4}' | awk -F/ '{print $1}'\n"
+  register: ansible_node_ip
+  until: ansible_node_ip.stdout != '*'
+  retries: 15
+  delay: 2
+  changed_when: false
+
+
 - name: Ensure temporary file is deleted
   file:
     path: "/tmp/{{ base_image_name }}"
