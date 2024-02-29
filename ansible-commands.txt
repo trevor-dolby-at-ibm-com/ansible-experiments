@@ -1,0 +1,297 @@
+https://www.redhat.com/sysadmin/build-VM-fast-ansible
+
+
+ubuntu@minikube-20231123:~/tmp/ansible/kvmlab/roles/kvm_provision$ ansible --version
+ansible 2.10.8
+  config file = None
+  configured module search path = ['/home/ubuntu/.ansible/plugins/modules', '/usr/share/ansible/plugins/modules']
+  ansible python module location = /usr/lib/python3/dist-packages/ansible
+  executable location = /usr/bin/ansible
+  python version = 3.10.12 (main, Nov 20 2023, 15:14:05) [GCC 11.4.0]
+
+
+mkdir -p kvmlab/roles && cd kvmlab/roles
+ansible-galaxy role init kvm_provision
+
+cd kvm_provision
+ls -l
+rm -r files handlers vars
+[files not created?]
+
+default/main.yml:
+---
+# defaults file for kvm_provision
+base_image_name: Fedora-Cloud-Base-39-1.5.x86_64.qcow2
+base_image_url: https://ask4.mm.fcix.net/fedora/linux/releases/39/Cloud/x86_64/images/{{ base_image_name }}
+base_image_sha: b9b621b26725ba95442d9a56cbaa054784e0779a9522ec6eafff07c6e6f717ea
+libvirt_pool_dir: "/var/lib/libvirt/images"
+vm_name: f34-dev
+vm_vcpus: 2
+vm_ram_mb: 2048
+vm_net: default
+vm_root_pass: passw0rd
+cleanup_tmp: no
+ssh_key: /root/.ssh/id_rsa.pub
+
+mkdir templates
+
+templates/vm-template.xml.j2:
+<domain type='kvm'>
+  <name>{{ vm_name }}</name>
+  <memory unit='MiB'>{{ vm_ram_mb }}</memory>
+  <vcpu placement='static'>{{ vm_vcpus }}</vcpu>
+  <os>
+    <type arch='x86_64' machine='pc-q35-5.2'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <cpu mode='host-model' check='none'/>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{{ libvirt_pool_dir }}/{{ vm_name }}.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x05' slot='0x00' function='0x0'/>
+    </disk>
+    <interface type='network'>
+      <source network='{{ vm_net }}'/>
+      <model type='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>
+    </interface>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+      <address type='virtio-serial' controller='0' bus='0' port='1'/>
+    </channel>
+    <channel type='spicevmc'>
+      <target type='virtio' name='com.redhat.spice.0'/>
+      <address type='virtio-serial' controller='0' bus='0' port='2'/>
+    </channel>
+    <input type='tablet' bus='usb'>
+      <address type='usb' bus='0' port='1'/>
+    </input>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <graphics type='spice' autoport='yes'>
+      <listen type='address'/>
+      <image compression='off'/>
+    </graphics>
+    <video>
+      <model type='qxl' ram='65536' vram='65536' vgamem='16384' heads='1' primary='yes'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x0'/>
+    </video>
+    <memballoon model='virtio'>
+      <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0'/>
+    </memballoon>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+      <address type='pci' domain='0x0000' bus='0x07' slot='0x00' function='0x0'/>
+    </rng>
+  </devices>
+</domain>
+
+
+
+tasks/main.yml:
+---
+# tasks file for kvm_provision
+- name: Ensure requirements in place
+  package:
+    name:
+      - guestfs-tools
+      - python3-libvirt
+    state: present
+  become: yes
+- name: Get VMs list
+  community.libvirt.virt:
+    command: list_vms
+  register: existing_vms
+  changed_when: no
+- name: Create VM if not exists
+  block:
+  - name: Download base image
+    get_url:
+      url: "{{ base_image_url }}"
+      dest: "/tmp/{{ base_image_name }}"
+      checksum: "sha256:{{ base_image_sha }}"
+  - name: Copy base image to libvirt directory
+    copy:
+      dest: "{{ libvirt_pool_dir }}/{{ vm_name }}.qcow2"
+      src: "/tmp/{{ base_image_name }}"
+      force: no
+      remote_src: yes 
+      mode: 0660
+    register: copy_results
+  - name: Configure the image
+    command: |
+      virt-customize -a {{ libvirt_pool_dir }}/{{ vm_name }}.qcow2 \
+      --hostname {{ vm_name }} \
+      --root-password password:{{ vm_root_pass }} \
+      --ssh-inject 'root:file:{{ ssh_key }}' \
+      --uninstall cloud-init --selinux-relabel
+    when: copy_results is changed
+  - name: Define vm
+    community.libvirt.virt:
+      command: define
+      xml: "{{ lookup('template', 'vm-template.xml.j2') }}"
+  when: "vm_name not in existing_vms.list_vms"
+- name: Ensure VM is started
+  community.libvirt.virt:
+    name: "{{ vm_name }}"
+    state: running
+  register: vm_start_results
+  until: "vm_start_results is success"
+  retries: 15
+  delay: 2
+- name: Ensure temporary file is deleted
+  file:
+    path: "/tmp/{{ base_image_name }}"
+    state: absent
+  when: cleanup_tmp | bool  
+
+
+
+kvm_provision.yaml:
+- name: Deploys VM based on cloud image
+  hosts: localhost
+  gather_facts: yes
+  become: yes
+  vars:
+    pool_dir: "/var/lib/libvirt/images"
+    vm: f34-lab01
+    vcpus: 2
+    ram_mb: 2048
+    cleanup: no
+    net: default
+    ssh_pub_key: "/home/ubuntu/.ssh/id_rsa.pub"
+
+  tasks:
+    - name: KVM Provision role
+      include_role:
+        name: kvm_provision
+      vars:
+        libvirt_pool_dir: "{{ pool_dir }}"
+        vm_name: "{{ vm }}"
+        vm_vcpus: "{{ vcpus }}"
+        vm_ram_mb: "{{ ram_mb }}"
+        vm_net: "{{ net }}"
+        cleanup_tmp: "{{ cleanup }}"
+        ssh_key: "{{ ssh_pub_key }}"
+
+
+ansible-galaxy collection install community.libvirt
+
+
+ansible-playbook -K kvm_provision.yaml
+
+ubuntu@minikube-20231123:~/tmp/ansible/kvmlab$ ansible-playbook -K kvm_provision.yaml
+BECOME password:
+[WARNING]: No inventory was parsed, only implicit localhost is available
+[WARNING]: provided hosts list is empty, only localhost is available. Note that the implicit localhost does not match 'all'
+
+PLAY [Deploys VM based on cloud image] ******************************************************************************************************************************************************************************************************
+
+TASK [Gathering Facts] **********************************************************************************************************************************************************************************************************************
+ok: [localhost]
+
+TASK [KVM Provision role] *******************************************************************************************************************************************************************************************************************
+
+TASK [kvm_provision : Ensure requirements in place] *****************************************************************************************************************************************************************************************
+changed: [localhost]
+
+TASK [kvm_provision : Get VMs list] *********************************************************************************************************************************************************************************************************
+fatal: [localhost]: FAILED! => {"changed": false, "msg": "The `lxml` module is not importable. Check the requirements."}
+
+PLAY RECAP **********************************************************************************************************************************************************************************************************************************
+localhost                  : ok=2    changed=1    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+
+
+
+sudo apt-get install python3-lxml
+
+
+
+TASK [kvm_provision : Get VMs list] *********************************************************************************************************************************************************************************************************
+An exception occurred during task execution. To see the full traceback, use -vvv. The error was: libvirt.libvirtError: Failed to connect socket to '/var/run/libvirt/libvirt-sock': No such file or directory
+fatal: [localhost]: FAILED! => {"changed": false, "msg": "Failed to connect socket to '/var/run/libvirt/libvirt-sock': No such file or directory"}
+
+
+
+
+
+apt install qemu qemu-kvm libvirt-clients libvirt-daemon-system virtinst bridge-utils
+
+
+TASK [kvm_provision : Download base image] **************************************************************************************************************************************************************************************************
+[WARNING]: File '/tmp/Fedora-Cloud-Base-39-1.5.x86_64.qcow2' created with default permissions '666'. The previous default was '666'. Specify 'mode' to avoid this warning.
+fatal: [localhost]: FAILED! => {"changed": true, "checksum_dest": null, "checksum_src": "cd4200e908280ef993146a06769cf9ea8fda096a", "dest": "/tmp/Fedora-Cloud-Base-39-1.5.x86_64.qcow2", "elapsed": 6, "msg": "The checksum for /tmp/Fedora-Cloud-Base-39-1.5.x86_64.qcow2 did not match b9b621b26725ba95442d9a56cbaa054784e0779a9522ec6eafff07c6e6f717ea; it was ab5be5058c5c839528a7d6373934e0ce5ad6c8f80bd71ed3390032027da52f37.", "src": "/home/ubuntu/.ansible/tmp/ansible-tmp-1709228976.0522742-32627-153021617588561/tmpjtritaq2", "url": "https://ask4.mm.fcix.net/fedora/linux/releases/39/Cloud/x86_64/images/Fedora-Cloud-Base-39-1.5.x86_64.qcow2"}
+
+[This is because the hash is copied from the original blog and is therefore a Fedora 34 hash]
+
+
+New default/main.yml:
+---
+# defaults file for kvm_provision
+base_image_name: Fedora-Cloud-Base-39-1.5.x86_64.qcow2
+base_image_url: https://ask4.mm.fcix.net/fedora/linux/releases/39/Cloud/x86_64/images/{{ base_image_name }}
+base_image_sha: ab5be5058c5c839528a7d6373934e0ce5ad6c8f80bd71ed3390032027da52f37
+libvirt_pool_dir: "/var/lib/libvirt/images"
+vm_name: f34-dev
+vm_vcpus: 2
+vm_ram_mb: 2048
+vm_net: default
+vm_root_pass: passw0rd
+cleanup_tmp: no
+ssh_key: /root/.ssh/id_rsa.pub
+
+
+
+
+TASK [kvm_provision : Download base image] **************************************************************************************************************************************************************************************************
+changed: [localhost]
+
+TASK [kvm_provision : Copy base image to libvirt directory] *********************************************************************************************************************************************************************************
+changed: [localhost]
+
+TASK [kvm_provision : Configure the image] **************************************************************************************************************************************************************************************************
+changed: [localhost]
+
+TASK [kvm_provision : Define vm] ************************************************************************************************************************************************************************************************************
+fatal: [localhost]: FAILED! => {"msg": "The task includes an option with an undefined variable. The error was: 'template' is undefined\n\nThe error appears to be in '/home/ubuntu/tmp/ansible/kvmlab/roles/kvm_provision/tasks/main.yml': line 38, column 5, but may\nbe elsewhere in the file depending on the exact syntax problem.\n\nThe offending line appears to be:\n\n    when: copy_results is changed\n  - name: Define vm\n    ^ here\n"}
+
+
+
+Missing single quotes on this line:
+      xml: "{{ lookup('template', 'vm-template.xml.j2') }}"
+
+
+Success; as root:
+root@minikube-20231123:~# virsh list
+ Id   Name        State
+---------------------------
+ 1    f34-lab01   running
+
+The next command showed nothing for several minutes, and then showed:
+
+root@minikube-20231123:~# virsh domifaddr f34-lab01
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+ vnet0      52:54:00:d6:81:e2    ipv4         192.168.122.20/24
+
+
+Changed all "f34" occurrences to "f39"
+Deleted the previous VM using "virsh undefine" followed by removing the qcow2 file from /var/lib/libvirt/images
+
+Rebooted and then re-ran "ansible-playbook -K kvm_provision.yaml"
+
+"virsh domifaddr f39-lab01" still took a while:
+ubuntu@minikube-20231123:~/tmp/ansible/kvmlab$ virsh domifaddr f39-lab01
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+
+ubuntu@minikube-20231123:~/tmp/ansible/kvmlab$ virsh domifaddr f39-lab01
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+ vnet0      52:54:00:6f:ae:02    ipv4         192.168.122.125/24
+
+
+"yum update" in the VM appeared to work as expected
